@@ -12,7 +12,6 @@ import (
 	"net/url"
 	"os"
 	"slices"
-	"sort"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -337,7 +336,6 @@ func requestLogger(log *slog.Logger, next http.Handler) http.Handler {
 			"request_id", id,
 			"method", r.Method,
 			"path", r.URL.Path,
-
 			"host", r.Host,
 			"content_type", r.Header.Get("Content-Type"),
 			"content_length", r.ContentLength,
@@ -347,7 +345,6 @@ func requestLogger(log *slog.Logger, next http.Handler) http.Handler {
 			"authorization_present", r.Header.Get("Authorization") != "",
 			"x_api_key_present", r.Header.Get("X-Api-Key") != "",
 			"anthropic_version_present", r.Header.Get("Anthropic-Version") != "",
-			"header_names", headerNames(r.Header),
 		)
 		next.ServeHTTP(tracked, r)
 		log.Info("request completed",
@@ -393,15 +390,6 @@ func (w *statusWriter) statusCode() int {
 		return http.StatusOK
 	}
 	return w.status
-}
-
-func headerNames(header http.Header) []string {
-	names := make([]string, 0, len(header))
-	for name := range header {
-		names = append(names, strings.ToLower(name))
-	}
-	sort.Strings(names)
-	return names
 }
 
 func requestIDFrom(ctx context.Context) string {
