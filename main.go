@@ -15,6 +15,7 @@ import (
 	"net/url"
 	"os"
 	"slices"
+	"sort"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -348,6 +349,7 @@ func requestLogger(log *slog.Logger, next http.Handler) http.Handler {
 			"authorization_present", r.Header.Get("Authorization") != "",
 			"x_api_key_present", r.Header.Get("X-Api-Key") != "",
 			"anthropic_version", r.Header.Get("Anthropic-Version"),
+			"header_names", headerNames(r.Header),
 		)
 		next.ServeHTTP(tracked, r)
 		log.Info("request completed",
@@ -400,6 +402,15 @@ func (w *statusWriter) statusCode() int {
 		return http.StatusOK
 	}
 	return w.status
+}
+
+func headerNames(header http.Header) []string {
+	names := make([]string, 0, len(header))
+	for name := range header {
+		names = append(names, strings.ToLower(name))
+	}
+	sort.Strings(names)
+	return names
 }
 
 func requestIDFrom(ctx context.Context) string {
