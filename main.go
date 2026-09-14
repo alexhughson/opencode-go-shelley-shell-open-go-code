@@ -1,18 +1,22 @@
 package main
 
 import (
+	"bufio"
+	"context"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
 	"os"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -81,6 +85,8 @@ type server struct {
 	proxy     *httputil.ReverseProxy
 }
 
+type requestIDKey struct{}
+
 func main() {
 	listen := flag.String("listen", envOr("LISTEN_ADDR", ":8000"), "HTTP listen address")
 	session := flag.String("session", os.Getenv("SHELLEY_CONVERSATION_ID"), "stable OpenCode session ID")
@@ -129,13 +135,43 @@ func newServer(log *slog.Logger, upstream *url.URL, sessionID string) *server {
 	originalDirector := proxy.Director
 	proxy.Director = func(req *http.Request) {
 		originalDirector(req)
-		req.Header.Set("X-OpenCode-Session", s.sessionID)
-		req.Header.Set("User-Agent", "exe.dev-opencode-go-proxy/1.0")
+		setUpstreamIdentity(req.Header, s.sessionID)
 		req.Host = upstream.Host
+		s.log.Info("forwarding upstream",
+			"request_id", requestIDFrom(req.Context()),
+			"method", req.Method,
+			"url", req.URL.String(),
+			"content_type", req.Header.Get("Content-Type"),
+			"content_length", req.ContentLength,
+			"authorization_present", req.Header.Get("Authorization") != "",
+			"x_api_key_present", req.Header.Get("X-Api-Key") != "",
+			"anthropic_version", req.Header.Get("Anthropic-Version"),
+		)
+	}
+	proxy.ModifyResponse = func(resp *http.Response) error {
+		fields := []any{
+			"request_id", requestIDFrom(resp.Request.Context()),
+			"status", resp.StatusCode,
+			"content_type", resp.Header.Get("Content-Type"),
+			"content_length", resp.ContentLength,
+		}
+		if resp.StatusCode >= 400 {
+			body, err := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+			if err == nil {
+				_ = resp.Body.Close()
+				resp.Body = io.NopCloser(strings.NewReader(string(body)))
+				resp.ContentLength = int64(len(body))
+				fields = append(fields, "error_body", strings.TrimSpace(string(body)))
+			}
+			s.log.Error("upstream response", fields...)
+		} else {
+			s.log.Info("upstream response", fields...)
+		}
+		return nil
 	}
 	proxy.Transport = transport
 	proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
-		s.log.Error("upstream request failed", "method", r.Method, "path", r.URL.Path, "error", err)
+		s.log.Error("upstream request failed", "request_id", requestIDFrom(r.Context()), "method", r.Method, "path", r.URL.Path, "error", err)
 		writeError(w, http.StatusBadGateway, "upstream request failed")
 	}
 	s.proxy = proxy
@@ -197,11 +233,19 @@ func (s *server) fetchModels(r *http.Request) (modelList, error) {
 	copyAuthHeaders(req.Header, r.Header)
 	setUpstreamIdentity(req.Header, s.sessionID)
 
+	s.log.Info("fetching upstream models",
+		"request_id", requestIDFrom(r.Context()),
+		"url", u.String(),
+		"authorization_present", req.Header.Get("Authorization") != "",
+		"x_api_key_present", req.Header.Get("X-Api-Key") != "",
+	)
 	resp, err := s.client.Do(req)
 	if err != nil {
+		s.log.Error("upstream models request failed", "request_id", requestIDFrom(r.Context()), "error", err)
 		return modelList{}, err
 	}
 	defer resp.Body.Close()
+	s.log.Info("upstream models response", "request_id", requestIDFrom(r.Context()), "status", resp.StatusCode, "content_type", resp.Header.Get("Content-Type"), "content_length", resp.ContentLength)
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		return modelList{}, fmt.Errorf("upstream returned %s: %s", resp.Status, strings.TrimSpace(string(body)))
@@ -281,11 +325,86 @@ func writeError(w http.ResponseWriter, status int, message string) {
 }
 
 func requestLogger(log *slog.Logger, next http.Handler) http.Handler {
+	var sequence atomic.Uint64
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		started := time.Now()
-		next.ServeHTTP(w, r)
-		log.Info("request", "method", r.Method, "path", r.URL.Path, "duration_ms", time.Since(started).Milliseconds())
+		incomingPath := r.URL.Path
+		id := fmt.Sprintf("proxy-%d-%d", started.UnixMilli(), sequence.Add(1))
+		r = r.WithContext(context.WithValue(r.Context(), requestIDKey{}, id))
+		w.Header().Set("X-Proxy-Request-ID", id)
+		tracked := &statusWriter{ResponseWriter: w}
+
+		log.Info("incoming request",
+			"request_id", id,
+			"method", r.Method,
+			"path", r.URL.Path,
+			"query", r.URL.RawQuery,
+			"host", r.Host,
+			"content_type", r.Header.Get("Content-Type"),
+			"content_length", r.ContentLength,
+			"user_agent", r.Header.Get("User-Agent"),
+			"x_forwarded_for", r.Header.Get("X-Forwarded-For"),
+			"x_forwarded_host", r.Header.Get("X-Forwarded-Host"),
+			"authorization_present", r.Header.Get("Authorization") != "",
+			"x_api_key_present", r.Header.Get("X-Api-Key") != "",
+			"anthropic_version", r.Header.Get("Anthropic-Version"),
+		)
+		next.ServeHTTP(tracked, r)
+		log.Info("request completed",
+			"request_id", id,
+			"method", r.Method,
+			"path", incomingPath,
+			"status", tracked.statusCode(),
+			"response_bytes", tracked.bytes,
+			"duration_ms", time.Since(started).Milliseconds(),
+		)
 	})
+}
+
+type statusWriter struct {
+	http.ResponseWriter
+	status int
+	bytes  int64
+}
+
+func (w *statusWriter) WriteHeader(status int) {
+	if w.status == 0 {
+		w.status = status
+	}
+	w.ResponseWriter.WriteHeader(status)
+}
+
+func (w *statusWriter) Write(p []byte) (int, error) {
+	if w.status == 0 {
+		w.status = http.StatusOK
+	}
+	n, err := w.ResponseWriter.Write(p)
+	w.bytes += int64(n)
+	return n, err
+}
+
+func (w *statusWriter) Flush() {
+	http.NewResponseController(w.ResponseWriter).Flush()
+}
+
+func (w *statusWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	return http.NewResponseController(w.ResponseWriter).Hijack()
+}
+
+func (w *statusWriter) Unwrap() http.ResponseWriter {
+	return w.ResponseWriter
+}
+
+func (w *statusWriter) statusCode() int {
+	if w.status == 0 {
+		return http.StatusOK
+	}
+	return w.status
+}
+
+func requestIDFrom(ctx context.Context) string {
+	id, _ := ctx.Value(requestIDKey{}).(string)
+	return id
 }
 
 func envOr(name, fallback string) string {
