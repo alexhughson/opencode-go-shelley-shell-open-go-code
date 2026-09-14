@@ -2,22 +2,25 @@
 
 # Use OpenCode Go models in Shelley
 
-A tiny stateless proxy. It sits between Shelley and [OpenCode Go](https://opencode.ai/zen/go)
-so you can pick OpenCode models from Shelley's model picker and just chat.
-No keys live on the VM — your token passes straight through.
+This is a stateless proxy that wraps OpenCode Go's API so it can be used with
+the LLM integration in exe.dev, and thus natively in Shelley on all your
+machines.
 
 ## The problem
 
-OpenCode Go lists every model as working with every API format. It doesn't.
-Each model only answers on one of `/responses`, `/completions`, or `/messages`,
-so requests fail with no useful error.
+OpenCode Go's `/v1/models` endpoint reports every model as supporting
+`/responses`. Most don't — each model only answers on one of `/responses`,
+`/completions`, or `/messages`. OpenCode Go also requires a session ID header
+on every request.
 
-The proxy fixes the listing: each model is tagged with the one endpoint that
-actually works. It also stamps every request with the session ID OpenCode Go
-wants.
+This proxy rewrites the models listing so each model carries the one endpoint
+that actually works, and stamps every upstream request with a session ID taken
+from Shelley's session ID when one is passed in.
 
 ## Use
 
-Deploy, then add the proxy URL as a single custom LLM provider in exe.dev.
-Shelley discovers the models and routes each one to its correct endpoint
-automatically.
+Deploy the proxy, then add its URL as a single custom LLM provider in exe.dev.
+Shelley picks up the models and routes each one to its correct endpoint.
+
+The machine hosting the proxy has to be public, otherwise the LLM provider
+can't reach it.
