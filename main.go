@@ -1,15 +1,12 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
-	"io"
 	"log/slog"
-	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -111,7 +108,7 @@ func main() {
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       2 * time.Minute,
 	}
-	log.Info("starting proxy", "listen", *listen, "upstream", upstream.String(), "session", *session)
+	log.Info("starting proxy", "listen", *listen, "upstream", upstream.String())
 	if err := httpServer.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
 		log.Error("server stopped", "error", err)
 		os.Exit(1)
@@ -141,12 +138,12 @@ func newServer(log *slog.Logger, upstream *url.URL, sessionID string) *server {
 		s.log.Info("forwarding upstream",
 			"request_id", requestIDFrom(req.Context()),
 			"method", req.Method,
-			"url", req.URL.String(),
+			"upstream_path", req.URL.Path,
 			"content_type", req.Header.Get("Content-Type"),
 			"content_length", req.ContentLength,
 			"authorization_present", req.Header.Get("Authorization") != "",
 			"x_api_key_present", req.Header.Get("X-Api-Key") != "",
-			"anthropic_version", req.Header.Get("Anthropic-Version"),
+			"anthropic_version_present", req.Header.Get("Anthropic-Version") != "",
 		)
 	}
 	proxy.ModifyResponse = func(resp *http.Response) error {
@@ -156,14 +153,9 @@ func newServer(log *slog.Logger, upstream *url.URL, sessionID string) *server {
 			"content_type", resp.Header.Get("Content-Type"),
 			"content_length", resp.ContentLength,
 		}
+		// Metadata-only: status, sizes, and types. Never bodies, query
+		// strings, or header values (auth uses presence-only flags).
 		if resp.StatusCode >= 400 {
-			body, err := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
-			if err == nil {
-				_ = resp.Body.Close()
-				resp.Body = io.NopCloser(strings.NewReader(string(body)))
-				resp.ContentLength = int64(len(body))
-				fields = append(fields, "error_body", strings.TrimSpace(string(body)))
-			}
 			s.log.Error("upstream response", fields...)
 		} else {
 			s.log.Info("upstream response", fields...)
@@ -185,19 +177,26 @@ func (s *server) routes() http.Handler {
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 	})
 
-	// exe.dev's LLM integration appends these paths to one configured base URL.
+	// exe.dev's LLM integration appends these paths to one configured base
+	// URL. /v1 aliases cover direct clients and provider probes.
+	for _, route := range []struct {
+		pattern      string
+		format       apiFormat
+		upstreamPath string
+	}{
+		{"POST /responses", formatResponses, "/v1/responses"},
+		{"POST /completions", formatChat, "/v1/chat/completions"},
+		{"POST /chat/completions", formatChat, "/v1/chat/completions"},
+		{"POST /messages", formatMessages, "/v1/messages"},
+		{"POST /v1/responses", formatResponses, "/v1/responses"},
+		{"POST /v1/completions", formatChat, "/v1/chat/completions"},
+		{"POST /v1/chat/completions", formatChat, "/v1/chat/completions"},
+		{"POST /v1/messages", formatMessages, "/v1/messages"},
+	} {
+		mux.HandleFunc(route.pattern, s.forward(route.format, route.upstreamPath))
+	}
 	mux.HandleFunc("GET /models", s.models)
-	mux.HandleFunc("POST /responses", s.forward(formatResponses, "/v1/responses"))
-	mux.HandleFunc("POST /completions", s.forward(formatChat, "/v1/chat/completions"))
-	mux.HandleFunc("POST /chat/completions", s.forward(formatChat, "/v1/chat/completions"))
-	mux.HandleFunc("POST /messages", s.forward(formatMessages, "/v1/messages"))
-
-	// Also accept conventional /v1 paths for direct clients and provider probes.
 	mux.HandleFunc("GET /v1/models", s.models)
-	mux.HandleFunc("POST /v1/responses", s.forward(formatResponses, "/v1/responses"))
-	mux.HandleFunc("POST /v1/completions", s.forward(formatChat, "/v1/chat/completions"))
-	mux.HandleFunc("POST /v1/chat/completions", s.forward(formatChat, "/v1/chat/completions"))
-	mux.HandleFunc("POST /v1/messages", s.forward(formatMessages, "/v1/messages"))
 
 	return requestLogger(s.log, mux)
 }
@@ -236,7 +235,7 @@ func (s *server) fetchModels(r *http.Request) (modelList, error) {
 
 	s.log.Info("fetching upstream models",
 		"request_id", requestIDFrom(r.Context()),
-		"url", u.String(),
+		"upstream_path", u.Path,
 		"authorization_present", req.Header.Get("Authorization") != "",
 		"x_api_key_present", req.Header.Get("X-Api-Key") != "",
 	)
@@ -248,8 +247,7 @@ func (s *server) fetchModels(r *http.Request) (modelList, error) {
 	defer resp.Body.Close()
 	s.log.Info("upstream models response", "request_id", requestIDFrom(r.Context()), "status", resp.StatusCode, "content_type", resp.Header.Get("Content-Type"), "content_length", resp.ContentLength)
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return modelList{}, fmt.Errorf("upstream returned %s: %s", resp.Status, strings.TrimSpace(string(body)))
+		return modelList{}, fmt.Errorf("upstream models status %d", resp.StatusCode)
 	}
 	var models modelList
 	if err := json.NewDecoder(resp.Body).Decode(&models); err != nil {
@@ -339,7 +337,7 @@ func requestLogger(log *slog.Logger, next http.Handler) http.Handler {
 			"request_id", id,
 			"method", r.Method,
 			"path", r.URL.Path,
-			"query", r.URL.RawQuery,
+
 			"host", r.Host,
 			"content_type", r.Header.Get("Content-Type"),
 			"content_length", r.ContentLength,
@@ -348,7 +346,7 @@ func requestLogger(log *slog.Logger, next http.Handler) http.Handler {
 			"x_forwarded_host", r.Header.Get("X-Forwarded-Host"),
 			"authorization_present", r.Header.Get("Authorization") != "",
 			"x_api_key_present", r.Header.Get("X-Api-Key") != "",
-			"anthropic_version", r.Header.Get("Anthropic-Version"),
+			"anthropic_version_present", r.Header.Get("Anthropic-Version") != "",
 			"header_names", headerNames(r.Header),
 		)
 		next.ServeHTTP(tracked, r)
@@ -385,16 +383,9 @@ func (w *statusWriter) Write(p []byte) (int, error) {
 	return n, err
 }
 
+// Flush preserves streaming through the reverse proxy.
 func (w *statusWriter) Flush() {
 	http.NewResponseController(w.ResponseWriter).Flush()
-}
-
-func (w *statusWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
-	return http.NewResponseController(w.ResponseWriter).Hijack()
-}
-
-func (w *statusWriter) Unwrap() http.ResponseWriter {
-	return w.ResponseWriter
 }
 
 func (w *statusWriter) statusCode() int {
