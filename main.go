@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -22,13 +21,13 @@ const upstreamBase = "https://opencode.ai/zen/go"
 type apiFormat string
 
 const (
-	formatResponses apiFormat = "openai_responses"
-	formatChat      apiFormat = "openai_chat_completions"
-	formatMessages  apiFormat = "anthropic_messages"
+	formatResponses apiFormat = "openai-responses"
+	formatChat      apiFormat = "openai-chat-completions"
+	formatMessages  apiFormat = "anthropic-messages"
 )
 
-// OpenCode Go's /v1/models endpoint does not say which wire format each model
-// accepts. This list follows the model table in the OpenCode Go documentation.
+// OpenCode Go's model endpoint omits the wire format each model requires.
+// These assignments follow the model table in the OpenCode Go documentation.
 var modelFormats = map[string]apiFormat{
 	"grok-4.6":                     formatResponses,
 	"gpt-5.6-luna":                 formatResponses,
@@ -65,8 +64,8 @@ type model struct {
 	Object   string    `json:"object"`
 	Created  int64     `json:"created,omitempty"`
 	OwnedBy  string    `json:"owned_by"`
-	APIType  apiFormat `json:"api_type,omitempty"`
-	Endpoint string    `json:"endpoint,omitempty"`
+	APIType  apiFormat `json:"api_type"`
+	Endpoint string    `json:"endpoint"`
 }
 
 type modelList struct {
@@ -149,28 +148,24 @@ func (s *server) routes() http.Handler {
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 	})
 
-	mux.HandleFunc("GET /v1/models", s.modelsAll)
-	mux.HandleFunc("POST /v1/responses", s.proxyFormat(formatResponses, "/v1/responses"))
-	mux.HandleFunc("POST /v1/chat/completions", s.proxyFormat(formatChat, "/v1/chat/completions"))
-	mux.HandleFunc("POST /v1/messages", s.proxyFormat(formatMessages, "/v1/messages"))
+	// exe.dev's LLM integration appends these paths to one configured base URL.
+	mux.HandleFunc("GET /models", s.models)
+	mux.HandleFunc("POST /responses", s.forward(formatResponses, "/v1/responses"))
+	mux.HandleFunc("POST /completions", s.forward(formatChat, "/v1/chat/completions"))
+	mux.HandleFunc("POST /chat/completions", s.forward(formatChat, "/v1/chat/completions"))
+	mux.HandleFunc("POST /messages", s.forward(formatMessages, "/v1/messages"))
 
-	for _, scoped := range []struct {
-		prefix string
-		format apiFormat
-		path   string
-	}{
-		{"/responses", formatResponses, "/v1/responses"},
-		{"/chat", formatChat, "/v1/chat/completions"},
-		{"/anthropic", formatMessages, "/v1/messages"},
-	} {
-		mux.HandleFunc("GET "+scoped.prefix+"/v1/models", s.modelsFor(scoped.format))
-		mux.HandleFunc("POST "+scoped.prefix+scoped.path, s.proxyFormat(scoped.format, scoped.path))
-	}
+	// Also accept conventional /v1 paths for direct clients and provider probes.
+	mux.HandleFunc("GET /v1/models", s.models)
+	mux.HandleFunc("POST /v1/responses", s.forward(formatResponses, "/v1/responses"))
+	mux.HandleFunc("POST /v1/completions", s.forward(formatChat, "/v1/chat/completions"))
+	mux.HandleFunc("POST /v1/chat/completions", s.forward(formatChat, "/v1/chat/completions"))
+	mux.HandleFunc("POST /v1/messages", s.forward(formatMessages, "/v1/messages"))
 
 	return requestLogger(s.log, mux)
 }
 
-func (s *server) modelsAll(w http.ResponseWriter, r *http.Request) {
+func (s *server) models(w http.ResponseWriter, r *http.Request) {
 	models, err := s.fetchModels(r)
 	if err != nil {
 		s.log.Error("model discovery failed", "error", err)
@@ -178,33 +173,18 @@ func (s *server) modelsAll(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	for i := range models.Data {
-		f, ok := modelFormats[models.Data[i].ID]
+		format, ok := modelFormats[models.Data[i].ID]
 		if !ok {
 			continue
 		}
-		models.Data[i].APIType = f
-		models.Data[i].Endpoint = endpointFor(f)
+		models.Data[i].APIType = format
+		models.Data[i].Endpoint = endpointFor(format)
 	}
 	models.Data = slices.DeleteFunc(models.Data, func(m model) bool {
-		_, ok := modelFormats[m.ID]
-		return !ok
+		_, documented := modelFormats[m.ID]
+		return !documented
 	})
 	writeJSON(w, http.StatusOK, models)
-}
-
-func (s *server) modelsFor(format apiFormat) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		models, err := s.fetchModels(r)
-		if err != nil {
-			s.log.Error("model discovery failed", "format", format, "error", err)
-			writeError(w, http.StatusBadGateway, "could not fetch upstream models")
-			return
-		}
-		models.Data = slices.DeleteFunc(models.Data, func(m model) bool {
-			return modelFormats[m.ID] != format
-		})
-		writeJSON(w, http.StatusOK, models)
-	}
 }
 
 func (s *server) fetchModels(r *http.Request) (modelList, error) {
@@ -215,8 +195,7 @@ func (s *server) fetchModels(r *http.Request) (modelList, error) {
 		return modelList{}, err
 	}
 	copyAuthHeaders(req.Header, r.Header)
-	req.Header.Set("X-OpenCode-Session", s.sessionID)
-	req.Header.Set("User-Agent", "exe.dev-opencode-go-proxy/1.0")
+	setUpstreamIdentity(req.Header, s.sessionID)
 
 	resp, err := s.client.Do(req)
 	if err != nil {
@@ -234,36 +213,17 @@ func (s *server) fetchModels(r *http.Request) (modelList, error) {
 	return models, nil
 }
 
-func (s *server) proxyFormat(format apiFormat, upstreamPath string) http.HandlerFunc {
+func (s *server) forward(format apiFormat, upstreamPath string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		body, err := io.ReadAll(r.Body)
-		if err != nil {
-			writeError(w, http.StatusBadRequest, "could not read request body")
-			return
-		}
-		var input struct {
-			Model string `json:"model"`
-		}
-		if err := json.Unmarshal(body, &input); err != nil {
-			writeError(w, http.StatusBadRequest, "request body must be JSON")
-			return
-		}
-		actual, known := modelFormats[input.Model]
-		if !known {
-			writeError(w, http.StatusBadRequest, fmt.Sprintf("model %q is not in the documented OpenCode Go model table", input.Model))
-			return
-		}
-		if actual != format {
-			writeError(w, http.StatusBadRequest, fmt.Sprintf("model %q requires %s at %s", input.Model, actual, endpointFor(actual)))
-			return
-		}
-
-		r.Body = io.NopCloser(bytes.NewReader(body))
-		r.ContentLength = int64(len(body))
 		normalizeAuth(r.Header, format)
 		r.URL.Path = upstreamPath
 		s.proxy.ServeHTTP(w, r)
 	}
+}
+
+func setUpstreamIdentity(header http.Header, sessionID string) {
+	header.Set("X-OpenCode-Session", sessionID)
+	header.Set("User-Agent", "exe.dev-opencode-go-proxy/1.0")
 }
 
 func normalizeAuth(header http.Header, format apiFormat) {
@@ -284,11 +244,11 @@ func normalizeAuth(header http.Header, format apiFormat) {
 func endpointFor(format apiFormat) string {
 	switch format {
 	case formatResponses:
-		return "/v1/responses"
+		return "/responses"
 	case formatChat:
-		return "/v1/chat/completions"
+		return "/completions"
 	case formatMessages:
-		return "/v1/messages"
+		return "/messages"
 	default:
 		return ""
 	}
