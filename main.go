@@ -60,13 +60,36 @@ var modelFormats = map[string]apiFormat{
 	"qwen3.6-plus":                 formatMessages,
 }
 
+// Reasoning levels mirror the effort variants OpenCode's provider transform
+// computes (packages/opencode/src/provider/transform.ts):
+//   - Responses/Chat models (@ai-sdk/openai, @ai-sdk/openai-compatible):
+//     reasoningEffort, one of low/medium/high plus model-specific extras.
+//     Verified live: muse-spark-1.3-contributor accepts low/medium/high/xhigh
+//     and rejects max; gpt-5.6-luna accepts off/low/medium/high/xhigh/max.
+//   - Messages models (@ai-sdk/anthropic): adaptive thinking effort.
+//     minimax-m3 is special-cased to a none/thinking toggle; other
+//     Anthropic transports take low/medium/high/xhigh/max.
+//   - deepseek, glm (non-5.2), kimi, qwen, minimax (non-m3), longcat, hy3/4:
+//     variants() returns {} — the gateway ignores effort for these, so no
+//     levels are advertised.
+var modelReasoningLevels = map[string][]string{
+	"grok-4.6":                   {"low", "medium", "high", "xhigh"},
+	"gpt-5.6-luna":               {"off", "low", "medium", "high", "xhigh", "max"},
+	"muse-spark-1.3-contributor": {"low", "medium", "high", "xhigh"},
+	"muse-spark-1.2-contributor": {"low", "medium", "high", "xhigh"},
+	"minimax-m3":                 {"none", "thinking"},
+	"minimax-m2.7":               {"none", "thinking"},
+	"minimax-m2.5":               {"none", "thinking"},
+}
+
 type model struct {
-	ID       string    `json:"id"`
-	Object   string    `json:"object"`
-	Created  int64     `json:"created,omitempty"`
-	OwnedBy  string    `json:"owned_by"`
-	APIType  apiFormat `json:"api_type"`
-	Endpoint string    `json:"endpoint"`
+	ID              string    `json:"id"`
+	Object          string    `json:"object"`
+	Created         int64     `json:"created,omitempty"`
+	OwnedBy         string    `json:"owned_by"`
+	APIType         apiFormat `json:"api_type"`
+	Endpoint        string    `json:"endpoint"`
+	ReasoningLevels []string  `json:"reasoning_levels,omitempty"`
 }
 
 type modelList struct {
@@ -214,6 +237,7 @@ func (s *server) models(w http.ResponseWriter, r *http.Request) {
 		}
 		models.Data[i].APIType = format
 		models.Data[i].Endpoint = endpointFor(format)
+		models.Data[i].ReasoningLevels = modelReasoningLevels[models.Data[i].ID]
 	}
 	models.Data = slices.DeleteFunc(models.Data, func(m model) bool {
 		_, documented := modelFormats[m.ID]

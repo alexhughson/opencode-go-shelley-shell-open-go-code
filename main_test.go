@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -47,14 +48,16 @@ func TestModelsAddsPerModelAPITypeAndSession(t *testing.T) {
 	want := map[string]struct {
 		api      apiFormat
 		endpoint string
+		levels   []string
 	}{
-		"gpt-5.6-luna": {formatResponses, "/responses"},
-		"glm-5.3":      {formatChat, "/completions"},
-		"minimax-m3":   {formatMessages, "/messages"},
+		"gpt-5.6-luna": {formatResponses, "/responses", []string{"off", "low", "medium", "high", "xhigh", "max"}},
+		"glm-5.3":      {formatChat, "/completions", nil},
+		"minimax-m3":   {formatMessages, "/messages", []string{"none", "thinking"}},
 	}
 	for _, m := range got.Data {
-		if m.APIType != want[m.ID].api || m.Endpoint != want[m.ID].endpoint {
-			t.Fatalf("model %s has api_type=%q endpoint=%q", m.ID, m.APIType, m.Endpoint)
+		w := want[m.ID]
+		if m.APIType != w.api || m.Endpoint != w.endpoint || !slices.Equal(m.ReasoningLevels, w.levels) {
+			t.Fatalf("model %s has api_type=%q endpoint=%q levels=%q", m.ID, m.APIType, m.Endpoint, m.ReasoningLevels)
 		}
 	}
 }
