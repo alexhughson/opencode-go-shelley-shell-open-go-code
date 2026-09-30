@@ -1,17 +1,20 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
 	"os"
 	"slices"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -27,8 +30,45 @@ const (
 	formatMessages  apiFormat = "anthropic-messages"
 )
 
-// OpenCode Go's model endpoint omits the wire format each model requires.
-// These assignments follow the model table in the OpenCode Go documentation.
+// Public IDs use a models.dev OpenRouter slug (vendor/model) when mapped,
+// otherwise opencode-go/<id>. Capability maps stay keyed by upstream ID.
+const publicModelPrefix = "opencode-go/"
+const legacyPublicModelPrefix = "opencode-go-"
+
+// OpenRouter slugs from models.dev provider "openrouter", keyed by the
+// OpenCode Go upstream id. Missing entries fall back to opencode-go/<id>.
+var publicModelIDs = map[string]string{
+	"grok-4.6":                     "x-ai/grok-4.6",
+	"gpt-5.6-luna":                 "openai/gpt-5.6-luna",
+	"muse-spark-1.3-contributor":   "meta/muse-spark-1.3-contributor",
+	"muse-spark-1.2-contributor":   "meta/muse-spark-1.2-contributor",
+	"glm-5.3-flash":                "z-ai/glm-5.3-flash",
+	"glm-5.3":                      "z-ai/glm-5.3",
+	"glm-5.2":                      "z-ai/glm-5.2",
+	"glm-5.1":                      "z-ai/glm-5.1",
+	"kimi-k3":                      "moonshotai/kimi-k3",
+	"kimi-k2.7-code":               "moonshotai/kimi-k2.7-code",
+	"kimi-k2.6":                    "moonshotai/kimi-k2.6",
+	"longcat-2.0":                  "meituan/longcat-2.0",
+	"deepseek-v4.1-flash":          "deepseek/deepseek-v4.1-flash",
+	"deepseek-v4-pro":              "deepseek/deepseek-v4-pro",
+	"deepseek-v4-flash":            "deepseek/deepseek-v4-flash",
+	"deepseek-v4-flash-vision-exp": "deepseek/deepseek-v4-flash-vision-exp",
+	"mimo-v2.5":                    "xiaomi/mimo-v2.5",
+	"mimo-v2.5-pro":                "xiaomi/mimo-v2.5-pro",
+	"hy4-preview":                  "tencent/hy4-preview",
+	"hy3":                          "tencent/hy3",
+	"minimax-m3":                   "minimax/minimax-m3",
+	"minimax-m2.7":                 "minimax/minimax-m2.7",
+	"minimax-m2.5":                 "minimax/minimax-m2.5",
+	"qwen3.8-flash":                "qwen/qwen3.8-flash",
+	"qwen3.7-max":                  "qwen/qwen3.7-max",
+	"qwen3.7-plus":                 "qwen/qwen3.7-plus",
+	"qwen3.6-plus":                 "qwen/qwen3.6-plus",
+}
+
+// OpenCode Go's /v1/models omits wire format and thinking levels.
+// Wire formats follow the model table in the OpenCode Go documentation.
 var modelFormats = map[string]apiFormat{
 	"grok-4.6":                     formatResponses,
 	"gpt-5.6-luna":                 formatResponses,
@@ -83,13 +123,14 @@ var modelReasoningLevels = map[string][]string{
 }
 
 type model struct {
-	ID              string    `json:"id"`
-	Object          string    `json:"object"`
-	Created         int64     `json:"created,omitempty"`
-	OwnedBy         string    `json:"owned_by"`
-	APIType         apiFormat `json:"api_type"`
-	Endpoint        string    `json:"endpoint"`
-	ReasoningLevels []string  `json:"reasoning_levels"`
+	ID                string    `json:"id"`
+	Object            string    `json:"object"`
+	Created           int64     `json:"created,omitempty"`
+	OwnedBy           string    `json:"owned_by"`
+	APIType           apiFormat `json:"api_type"`
+	Endpoint          string    `json:"endpoint"`
+	SupportsReasoning bool      `json:"supports_reasoning,omitempty"`
+	ReasoningLevels   []string  `json:"reasoning_levels"`
 }
 
 type modelList struct {
@@ -230,21 +271,22 @@ func (s *server) models(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadGateway, "could not fetch upstream models")
 		return
 	}
-	for i := range models.Data {
-		format, ok := modelFormats[models.Data[i].ID]
-		if !ok {
-			continue
-		}
-		models.Data[i].APIType = format
-		models.Data[i].Endpoint = endpointFor(format)
-		// An explicit empty list means no selectable effort controls. Omitting
-		// it lets consumers substitute another provider's catalog capabilities.
-		models.Data[i].ReasoningLevels = append([]string{}, modelReasoningLevels[models.Data[i].ID]...)
-	}
 	models.Data = slices.DeleteFunc(models.Data, func(m model) bool {
 		_, documented := modelFormats[m.ID]
 		return !documented
 	})
+	for i := range models.Data {
+		upstreamID := models.Data[i].ID
+		format := modelFormats[upstreamID]
+		levels := modelReasoningLevels[upstreamID]
+		models.Data[i].ID = publicModelID(upstreamID)
+		models.Data[i].APIType = format
+		models.Data[i].Endpoint = endpointFor(format)
+		// An explicit empty list means no selectable effort controls. Omitting
+		// it lets consumers substitute another provider's catalog capabilities.
+		models.Data[i].ReasoningLevels = append([]string{}, levels...)
+		models.Data[i].SupportsReasoning = len(levels) > 0
+	}
 	writeJSON(w, http.StatusOK, models)
 }
 
@@ -283,10 +325,90 @@ func (s *server) fetchModels(r *http.Request) (modelList, error) {
 
 func (s *server) forward(format apiFormat, upstreamPath string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		if err := rewriteRequestModelID(r); err != nil {
+			s.log.Error("model id rewrite failed", "request_id", requestIDFrom(r.Context()), "error", err)
+			writeError(w, http.StatusBadRequest, "request body must be JSON with a string model id")
+			return
+		}
 		normalizeAuth(r.Header, format)
 		r.URL.Path = upstreamPath
 		s.proxy.ServeHTTP(w, r)
 	}
+}
+
+func publicModelID(upstreamID string) string {
+	if id, ok := publicModelIDs[upstreamID]; ok {
+		return id
+	}
+	return publicModelPrefix + upstreamID
+}
+
+func upstreamModelID(id string) string {
+	if strings.HasPrefix(id, publicModelPrefix) {
+		return strings.TrimPrefix(id, publicModelPrefix)
+	}
+	if strings.HasPrefix(id, legacyPublicModelPrefix) {
+		return strings.TrimPrefix(id, legacyPublicModelPrefix)
+	}
+	if i := strings.LastIndex(id, "/"); i >= 0 {
+		tail := id[i+1:]
+		if _, ok := modelFormats[tail]; ok {
+			return tail
+		}
+	}
+	return id
+}
+
+func rewriteRequestModelID(r *http.Request) error {
+	if r.Body == nil {
+		return nil
+	}
+	body, err := io.ReadAll(r.Body)
+	_ = r.Body.Close()
+	if err != nil {
+		return err
+	}
+	if len(bytes.TrimSpace(body)) == 0 {
+		r.Body = http.NoBody
+		r.ContentLength = 0
+		r.Header.Set("Content-Length", "0")
+		return nil
+	}
+	rewritten, err := rewritePublicModelID(body)
+	if err != nil {
+		return err
+	}
+	r.Body = io.NopCloser(bytes.NewReader(rewritten))
+	r.ContentLength = int64(len(rewritten))
+	r.Header.Set("Content-Length", strconv.FormatInt(r.ContentLength, 10))
+	return nil
+}
+
+func rewritePublicModelID(body []byte) ([]byte, error) {
+	// Leave provider-specific fields opaque: only the top-level model ID
+	// belongs to the proxy, not reasoning controls or request encoding.
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return nil, err
+	}
+	raw, ok := payload["model"]
+	if !ok {
+		return body, nil
+	}
+	var modelID string
+	if err := json.Unmarshal(raw, &modelID); err != nil {
+		return nil, fmt.Errorf("model must be a string")
+	}
+	upstreamID := upstreamModelID(modelID)
+	if upstreamID == modelID {
+		return body, nil
+	}
+	encoded, err := json.Marshal(upstreamID)
+	if err != nil {
+		return nil, err
+	}
+	payload["model"] = encoded
+	return json.Marshal(payload)
 }
 
 func setUpstreamIdentity(header http.Header, sessionID string) {

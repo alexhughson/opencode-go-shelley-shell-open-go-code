@@ -25,6 +25,17 @@ Shelley picks up the models and routes each one to its correct endpoint.
 The machine hosting the proxy has to be public, otherwise the LLM provider
 can't reach it.
 
+## Model IDs
+
+The models listing uses mapped OpenRouter-style IDs such as
+`meta/muse-spark-1.3-contributor`, falling back to `opencode-go/<upstream-id>`.
+Requests translate these public IDs back to OpenCode Go's IDs. Bare upstream
+IDs and legacy `opencode-go-<upstream-id>` IDs remain accepted.
+
+The proxy does not translate between API formats or encode reasoning controls.
+It changes only the top-level model ID, routing, and required headers; the
+client remains responsible for the provider-specific request body.
+
 ## Thinking-level discovery
 
 The proxy advertises endpoint-specific `supports_reasoning` and
