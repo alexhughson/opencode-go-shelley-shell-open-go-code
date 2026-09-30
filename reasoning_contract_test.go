@@ -48,6 +48,34 @@ func TestMuseReasoningDiscoveryContract(t *testing.T) {
 	}
 }
 
+func TestNoEffortControlsAreExplicit(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, modelList{Object: "list", Data: []model{
+			{ID: "glm-5.3", Object: "model", OwnedBy: "opencode"},
+		}})
+	}))
+	defer upstream.Close()
+	u, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := newServer(slog.New(slog.NewTextHandler(io.Discard, nil)), u, "test-session")
+	res := httptest.NewRecorder()
+	s.routes().ServeHTTP(res, httptest.NewRequest(http.MethodGet, "/models", nil))
+	if res.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", res.Code, res.Body.String())
+	}
+	var list struct {
+		Data []map[string]json.RawMessage `json:"data"`
+	}
+	if err := json.Unmarshal(res.Body.Bytes(), &list); err != nil {
+		t.Fatal(err)
+	}
+	if len(list.Data) != 1 || string(list.Data[0]["reasoning_levels"]) != "[]" {
+		t.Fatalf("expected explicit empty controls, got %s", res.Body.String())
+	}
+}
+
 func TestReasoningPayloadSurvivesProxy(t *testing.T) {
 	for _, tc := range []struct {
 		name, path, upstreamPath, publicID, upstreamID, body string

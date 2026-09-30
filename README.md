@@ -48,7 +48,9 @@ Consumers need to read that metadata explicitly. Looking up the proxy hostname
 in models.dev cannot identify the upstream provider; matching a model name in
 another provider's catalog may describe different controls. An advertised list
 is endpoint-specific evidence, while missing metadata is unknown, not permission
-to show every effort level.
+to show every effort level. Models without mapped effort controls explicitly
+advertise `reasoning_levels: []`; consumers must not fill that empty list from
+another catalog.
 
 The proxy only rewrites the request's model ID; it preserves reasoning fields.
 Shelley must both expose the advertised list in its models API and use it when

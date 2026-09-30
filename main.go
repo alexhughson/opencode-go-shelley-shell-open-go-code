@@ -89,7 +89,7 @@ type model struct {
 	OwnedBy         string    `json:"owned_by"`
 	APIType         apiFormat `json:"api_type"`
 	Endpoint        string    `json:"endpoint"`
-	ReasoningLevels []string  `json:"reasoning_levels,omitempty"`
+	ReasoningLevels []string  `json:"reasoning_levels"`
 }
 
 type modelList struct {
@@ -237,7 +237,9 @@ func (s *server) models(w http.ResponseWriter, r *http.Request) {
 		}
 		models.Data[i].APIType = format
 		models.Data[i].Endpoint = endpointFor(format)
-		models.Data[i].ReasoningLevels = modelReasoningLevels[models.Data[i].ID]
+		// An explicit empty list means no selectable effort controls. Omitting
+		// it lets consumers substitute another provider's catalog capabilities.
+		models.Data[i].ReasoningLevels = append([]string{}, modelReasoningLevels[models.Data[i].ID]...)
 	}
 	models.Data = slices.DeleteFunc(models.Data, func(m model) bool {
 		_, documented := modelFormats[m.ID]
